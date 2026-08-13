@@ -15,6 +15,7 @@
 //! bridging async `mpsc` channels on both sides. Queues are bounded so overload
 //! surfaces as channel-full errors rather than unbounded memory growth.
 
+mod path;
 mod remote;
 
 use std::error::Error;
@@ -22,7 +23,6 @@ use std::fmt;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,15 +49,13 @@ use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
-use codex_config::config_toml::ConfigToml;
 use codex_core::config::Config;
 pub use codex_core::otel_init::build_provider as build_otel_provider;
-use codex_core::personality_migration::PersonalityMigrationStatus;
-use codex_core::personality_migration::maybe_migrate_personality;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::ExecServerRuntimePaths;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -65,6 +63,7 @@ use tokio::time::timeout;
 use toml::Value as TomlValue;
 use tracing::warn;
 
+pub use crate::path::AppServerPath;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
@@ -75,9 +74,6 @@ pub use crate::remote::RemoteAppServerEndpoint;
 /// module exists so clients can remove a direct `codex-core` dependency
 /// while legacy startup/config paths are migrated to RPCs.
 pub mod legacy_core {
-    pub use codex_core::check_execpolicy_for_warnings;
-    pub use codex_core::format_exec_policy_error_with_source;
-
     pub mod config {
         pub use codex_core::config::*;
 
@@ -88,23 +84,8 @@ pub mod legacy_core {
 }
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Runs the embedded app-server personality migration.
-///
-/// Returns `true` when the migration changed config and the caller should reload it.
-pub async fn migrate_personality_if_needed(
-    codex_home: &Path,
-    config_toml: &ConfigToml,
-    state_db: Option<StateDbHandle>,
-) -> IoResult<bool> {
-    let status = maybe_migrate_personality(codex_home, config_toml, state_db).await?;
-    match status {
-        PersonalityMigrationStatus::Applied => Ok(true),
-        PersonalityMigrationStatus::SkippedMarker
-        | PersonalityMigrationStatus::SkippedExplicitPersonality
-        | PersonalityMigrationStatus::SkippedNoSessions => Ok(false),
-    }
-}
+// Covers the embedded drain, its analytics flush, and final task join.
+const IN_PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Raw app-server request result for typed in-process requests.
 ///
@@ -116,8 +97,8 @@ pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
 #[derive(Debug, Clone)]
 pub enum AppServerEvent {
     Lagged { skipped: usize },
-    ServerNotification(ServerNotification),
-    ServerRequest(ServerRequest),
+    ServerNotification(Box<ServerNotification>),
+    ServerRequest(Box<ServerRequest>),
     Disconnected { message: String },
 }
 
@@ -224,7 +205,7 @@ where
                     *skipped_events = skipped_events.saturating_add(1);
                     warn!("dropping in-process app-server event because consumer queue is full");
                     if let InProcessServerEvent::ServerRequest(request) = event {
-                        reject_server_request(request);
+                        reject_server_request(*request);
                     }
                     return ForwardEventResult::Continue;
                 }
@@ -250,7 +231,7 @@ where
             *skipped_events = skipped_events.saturating_add(1);
             warn!("dropping in-process app-server event because consumer queue is full");
             if let InProcessServerEvent::ServerRequest(request) = event {
-                reject_server_request(request);
+                reject_server_request(*request);
             }
             ForwardEventResult::Continue
         }
@@ -347,6 +328,8 @@ pub struct InProcessClientStartArgs {
     pub client_version: String,
     /// Whether experimental APIs are requested at initialize time.
     pub experimental_api: bool,
+    /// Whether MCP servers may send `openai/form` elicitation requests.
+    pub mcp_server_openai_form_elicitation: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
     /// Queue capacity for command/event channels (clamped to at least 1).
@@ -366,11 +349,13 @@ impl InProcessClientStartArgs {
         let capabilities = InitializeCapabilities {
             experimental_api: self.experimental_api,
             request_attestation: false,
+            extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
             } else {
                 Some(self.opt_out_notification_methods.clone())
             },
+            mcp_server_openai_form_elicitation: self.mcp_server_openai_form_elicitation,
         };
 
         InitializeParams {
@@ -538,9 +523,9 @@ impl InProcessAppServerClient {
                         let Some(event) = event else {
                             break;
                         };
-                        if let InProcessServerEvent::ServerRequest(
-                            ServerRequest::ChatgptAuthTokensRefresh { request_id, .. }
-                        ) = &event
+                        if let InProcessServerEvent::ServerRequest(request) = &event
+                            && let ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } =
+                                request.as_ref()
                         {
                             let send_result = request_sender.fail_server_request(
                                 request_id.clone(),
@@ -635,20 +620,22 @@ impl InProcessAppServerClient {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
+        let method = request.method_name();
         let response =
             self.request(request)
                 .await
                 .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
+                    method: method.to_string(),
                     source,
                 })?;
         let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
+            method: method.to_string(),
             source,
         })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
+            method: method.to_string(),
+            source,
+        })
     }
 
     /// Sends a typed client notification.
@@ -763,7 +750,7 @@ impl InProcessAppServerClient {
             .send(ClientCommand::Shutdown { response_tx })
             .await
             .is_ok()
-            && let Ok(command_result) = timeout(SHUTDOWN_TIMEOUT, response_rx).await
+            && let Ok(command_result) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, response_rx).await
         {
             command_result.map_err(|_| {
                 IoError::new(
@@ -773,7 +760,7 @@ impl InProcessAppServerClient {
             })??;
         }
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut worker_handle).await {
+        if let Err(_elapsed) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle).await {
             worker_handle.abort();
             let _ = worker_handle.await;
         }
@@ -808,20 +795,22 @@ impl InProcessAppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
+        let method = request.method_name();
         let response =
             self.request(request)
                 .await
                 .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
+                    method: method.to_string(),
                     source,
                 })?;
         let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
+            method: method.to_string(),
             source,
         })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
+            method: method.to_string(),
+            source,
+        })
     }
 }
 
@@ -845,6 +834,15 @@ impl AppServerRequestHandle {
 }
 
 impl AppServerClient {
+    pub fn codex_home(&self, local_codex_home: &AbsolutePathBuf) -> Option<AppServerPath> {
+        match self {
+            Self::InProcess(_) => Some(AppServerPath::from_app_server(
+                local_codex_home.display().to_string(),
+            )),
+            Self::Remote(client) => client.codex_home().map(AppServerPath::from_app_server),
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(client) => client.request(request).await,
@@ -911,20 +909,6 @@ impl AppServerClient {
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
         }
     }
-}
-
-/// Extracts the JSON-RPC method name for diagnostics without extending the
-/// protocol crate with in-process-only helpers.
-pub(crate) fn request_method_name(request: &ClientRequest) -> String {
-    serde_json::to_value(request)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 #[cfg(test)]
@@ -1032,6 +1016,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity,
         })
@@ -1110,6 +1095,7 @@ mod tests {
                 id: request.id,
                 result: serde_json::json!({
                     "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
+                    "codexHome": "/server/.codex",
                 }),
             }),
         )
@@ -1224,9 +1210,23 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         }
+    }
+
+    #[test]
+    fn remote_initialize_params_forward_openai_form_capability() {
+        let mut args = test_remote_connect_args("ws://localhost/rpc".to_string());
+        args.mcp_server_openai_form_elicitation = true;
+
+        assert!(
+            args.initialize_params()
+                .capabilities
+                .expect("initialize capabilities")
+                .mcp_server_openai_form_elicitation
+        );
     }
 
     #[tokio::test]
@@ -1333,9 +1333,9 @@ mod tests {
     async fn forward_in_process_event_preserves_transcript_notifications_under_backpressure() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx
-            .send(InProcessServerEvent::ServerNotification(
+            .send(InProcessServerEvent::ServerNotification(Box::new(
                 command_execution_output_delta_notification("stdout-1"),
-            ))
+            )))
             .await
             .expect("initial event should enqueue");
 
@@ -1343,8 +1343,8 @@ mod tests {
         let result = forward_in_process_event(
             &event_tx,
             &mut skipped_events,
-            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
-                "stdout-2",
+            InProcessServerEvent::ServerNotification(Box::new(
+                command_execution_output_delta_notification("stdout-2"),
             )),
             |_| {},
         )
@@ -1373,7 +1373,7 @@ mod tests {
             let result = forward_in_process_event(
                 &event_tx,
                 &mut skipped_events,
-                InProcessServerEvent::ServerNotification(notification),
+                InProcessServerEvent::ServerNotification(Box::new(notification)),
                 |_| {},
             )
             .await;
@@ -1386,9 +1386,12 @@ mod tests {
             .expect("receiver task should join successfully");
         assert!(matches!(
             &events[0],
-            InProcessServerEvent::ServerNotification(
-                ServerNotification::CommandExecutionOutputDelta(notification)
-            ) if notification.delta == "stdout-1"
+            InProcessServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.delta == "stdout-1"
+                )
         ));
         assert!(matches!(
             &events[1],
@@ -1396,24 +1399,35 @@ mod tests {
         ));
         assert!(matches!(
             &events[2],
-            InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
-                notification
-            )) if notification.delta == "hello"
+            InProcessServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::AgentMessageDelta(notification)
+                        if notification.delta == "hello"
+                )
         ));
         assert!(matches!(
             &events[3],
-            InProcessServerEvent::ServerNotification(ServerNotification::ItemCompleted(
-                notification
-            )) if matches!(
-                &notification.item,
-                codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "hello"
-            )
+            InProcessServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::ItemCompleted(notification)
+                        if matches!(
+                            &notification.item,
+                            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                                if text == "hello"
+                        )
+                )
         ));
         assert!(matches!(
             &events[4],
-            InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                notification
-            )) if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+            InProcessServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::TurnCompleted(notification)
+                        if notification.turn.status
+                            == codex_app_server_protocol::TurnStatus::Completed
+                )
         ));
     }
 
@@ -1446,6 +1460,7 @@ mod tests {
             .expect("remote client should connect");
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
+        assert_eq!(client.codex_home(), Some("/server/.codex"));
         let response: GetAccountResponse = client
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
@@ -1498,6 +1513,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1586,6 +1602,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1605,6 +1622,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1750,7 +1768,8 @@ mod tests {
         let event = client.next_event().await.expect("event should arrive");
         assert!(matches!(
             event,
-            AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(_))
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::AccountUpdated(_))
         ));
 
         client.shutdown().await.expect("shutdown should complete");
@@ -1796,9 +1815,12 @@ mod tests {
             .expect("event stream should stay open");
         assert!(matches!(
             first_event,
-            AppServerEvent::ServerNotification(ServerNotification::CommandExecutionOutputDelta(
-                notification
-            )) if notification.delta == "stdout-1"
+            AppServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.delta == "stdout-1"
+                )
         ));
 
         let mut remaining_events = Vec::new();
@@ -1815,30 +1837,31 @@ mod tests {
         for event in &remaining_events {
             match event {
                 AppServerEvent::Lagged { skipped: 1 } => {}
-                AppServerEvent::ServerNotification(
-                    ServerNotification::CommandExecutionOutputDelta(notification),
-                ) if notification.delta == "stdout-2" => {}
-                AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
-                    notification,
-                )) if notification.delta == "hello" => {
-                    transcript_event_names.push("agent_message_delta");
-                }
-                AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
-                    notification,
-                )) if matches!(
-                    &notification.item,
-                    codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "hello"
-                ) =>
-                {
-                    transcript_event_names.push("item_completed");
-                }
-                AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                    notification,
-                )) if notification.turn.status
-                    == codex_app_server_protocol::TurnStatus::Completed =>
-                {
-                    transcript_event_names.push("turn_completed");
-                }
+                AppServerEvent::ServerNotification(notification) => match notification.as_ref() {
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.delta == "stdout-2" => {}
+                    ServerNotification::AgentMessageDelta(notification)
+                        if notification.delta == "hello" =>
+                    {
+                        transcript_event_names.push("agent_message_delta");
+                    }
+                    ServerNotification::ItemCompleted(notification)
+                        if matches!(
+                            &notification.item,
+                            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                                if text == "hello"
+                        ) =>
+                    {
+                        transcript_event_names.push("item_completed");
+                    }
+                    ServerNotification::TurnCompleted(notification)
+                        if notification.turn.status
+                            == codex_app_server_protocol::TurnStatus::Completed =>
+                    {
+                        transcript_event_names.push("turn_completed");
+                    }
+                    _ => panic!("unexpected remaining event: {event:?}"),
+                },
                 _ => panic!("unexpected remaining event: {event:?}"),
             }
         }
@@ -1874,6 +1897,8 @@ mod tests {
                             is_secret: false,
                             options: Some(vec![]),
                         }],
+                        is_blocking: true,
+                        auto_resolution_ms: None,
                     })
                     .expect("params should serialize"),
                 ),
@@ -1935,6 +1960,8 @@ mod tests {
                                 is_secret: false,
                                 options: Some(vec![]),
                             }],
+                            is_blocking: true,
+                            auto_resolution_ms: None,
                         })
                         .expect("params should serialize"),
                     ),
@@ -2098,7 +2125,7 @@ mod tests {
     #[test]
     fn event_requires_delivery_marks_transcript_and_terminal_events() {
         assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
+            &InProcessServerEvent::ServerNotification(Box::new(
                 codex_app_server_protocol::ServerNotification::TurnCompleted(
                     codex_app_server_protocol::TurnCompletedNotification {
                         thread_id: "thread".to_string(),
@@ -2114,10 +2141,10 @@ mod tests {
                         },
                     }
                 )
-            )
+            ))
         ));
         assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
+            &InProcessServerEvent::ServerNotification(Box::new(
                 codex_app_server_protocol::ServerNotification::AgentMessageDelta(
                     codex_app_server_protocol::AgentMessageDeltaNotification {
                         thread_id: "thread".to_string(),
@@ -2126,10 +2153,10 @@ mod tests {
                         delta: "hello".to_string(),
                     }
                 )
-            )
+            ))
         ));
         assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
+            &InProcessServerEvent::ServerNotification(Box::new(
                 codex_app_server_protocol::ServerNotification::ItemCompleted(
                     codex_app_server_protocol::ItemCompletedNotification {
                         thread_id: "thread".to_string(),
@@ -2143,20 +2170,23 @@ mod tests {
                         },
                     }
                 )
-            )
+            ))
         ));
         assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
+            &InProcessServerEvent::ServerNotification(Box::new(
                 codex_app_server_protocol::ServerNotification::ExternalAgentConfigImportCompleted(
-                    codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification {},
+                    codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification {
+                        import_id: "import".to_string(),
+                        item_type_results: Vec::new(),
+                    },
                 )
-            )
+            ))
         ));
         assert!(!event_requires_delivery(&InProcessServerEvent::Lagged {
             skipped: 1
         }));
         assert!(!event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
+            &InProcessServerEvent::ServerNotification(Box::new(
                 codex_app_server_protocol::ServerNotification::CommandExecutionOutputDelta(
                     codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
                         thread_id: "thread".to_string(),
@@ -2165,12 +2195,12 @@ mod tests {
                         delta: "stdout".to_string(),
                     }
                 )
-            )
+            ))
         ));
     }
 
     #[tokio::test]
-    async fn runtime_start_args_forward_environment_manager() {
+    async fn runtime_start_args_forward_environment_manager_and_openai_form_capability() {
         let config = Arc::new(build_test_config().await);
         let environment_manager = Arc::new(
             EnvironmentManager::create_for_tests(
@@ -2203,12 +2233,20 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: true,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         }
         .into_runtime_start_args();
 
         assert_eq!(runtime_args.config, config);
+        assert!(
+            runtime_args
+                .initialize
+                .capabilities
+                .expect("initialize capabilities")
+                .mcp_server_openai_form_elicitation
+        );
         assert!(Arc::ptr_eq(
             &runtime_args.environment_manager,
             &environment_manager
@@ -2244,6 +2282,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         }
@@ -2268,5 +2307,33 @@ mod tests {
             .await
             .expect("shutdown should not wait for the 5s fallback timeout")
             .expect("shutdown should complete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_in_process_drain() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let worker_handle = tokio::spawn(async move {
+            let response_tx = match command_rx.recv().await {
+                Some(ClientCommand::Shutdown { response_tx }) => response_tx,
+                _ => panic!("expected shutdown command"),
+            };
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            worker_completed.store(true, Ordering::Release);
+            let _ = response_tx.send(Ok(()));
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+        };
+
+        client.shutdown().await.expect("shutdown should complete");
+        assert!(completed.load(Ordering::Acquire));
     }
 }

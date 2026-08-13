@@ -1,10 +1,14 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
@@ -15,6 +19,7 @@ use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -41,6 +46,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use test_case::test_case;
 
 fn absolute_path(path: &Path) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(path).expect("absolute path")
@@ -164,23 +170,6 @@ fn exec_command_event_with_missing_additional_permissions(
     Ok(ev_function_call(call_id, "exec_command", &args_str))
 }
 
-fn shell_event_with_raw_request_permissions(
-    call_id: &str,
-    command: &str,
-    workdir: Option<&str>,
-    additional_permissions: Value,
-) -> Result<Value> {
-    let args = json!({
-        "command": command,
-        "workdir": workdir,
-        "timeout_ms": 1_000_u64,
-        "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
-        "additional_permissions": additional_permissions,
-    });
-    let args_str = serde_json::to_string(&args)?;
-    Ok(ev_function_call(call_id, "shell_command", &args_str))
-}
-
 async fn submit_turn(
     test: &TestCodex,
     prompt: &str,
@@ -191,31 +180,28 @@ async fn submit_turn(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -507,8 +493,18 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AdditionalPermissionsCommandTool {
+    ShellCommand,
+    ExecCommand,
+}
+
+#[test_case(AdditionalPermissionsCommandTool::ShellCommand ; "shell_command")]
+#[test_case(AdditionalPermissionsCommandTool::ExecCommand ; "exec_command")]
 #[tokio::test(flavor = "current_thread")]
-async fn relative_additional_permissions_resolve_against_tool_workdir() -> Result<()> {
+async fn relative_additional_permissions_resolve_against_tool_workdir(
+    command_tool: AdditionalPermissionsCommandTool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -542,6 +538,12 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
 
     let call_id = "request_permissions_relative_workdir";
     let command = "touch relative-write.txt";
+    let workdir = "nested";
+    let additional_permissions = json!({
+        "file_system": {
+            "write": ["."],
+        },
+    });
     let expected_permissions = PermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
             /*read*/ None,
@@ -549,16 +551,27 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
         )),
         ..Default::default()
     };
-    let event = shell_event_with_raw_request_permissions(
-        call_id,
-        command,
-        Some("nested"),
-        json!({
-            "file_system": {
-                "write": ["."],
-            },
-        }),
-    )?;
+    let (tool_name, arguments) = match command_tool {
+        AdditionalPermissionsCommandTool::ShellCommand => (
+            "shell_command",
+            json!({
+                "command": command,
+                "workdir": workdir,
+                "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
+                "additional_permissions": additional_permissions,
+            }),
+        ),
+        AdditionalPermissionsCommandTool::ExecCommand => (
+            "exec_command",
+            json!({
+                "cmd": command,
+                "workdir": workdir,
+                "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
+                "additional_permissions": additional_permissions,
+            }),
+        ),
+    };
+    let event = ev_function_call(call_id, tool_name, &serde_json::to_string(&arguments)?);
 
     let _ = mount_sse_once(
         &server,
@@ -1006,7 +1019,7 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
             turn_id: None,
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::denied("rejected by user"),
         })
         .await?;
     wait_for_completion(&test).await;
@@ -1148,7 +1161,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
     let exec_output = responses
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let result = parse_result(&exec_output);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout.trim(), "sticky-grant-ok");
@@ -1262,7 +1275,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
     let exec_output = responses
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let result = parse_result(&exec_output);
     assert!(
         result.exit_code.is_none_or(|exit_code| exit_code == 0),
@@ -1379,7 +1392,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
     let shell_output = responses
         .function_call_output_text("shell-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected shell-call output"));
+        .expect("expected shell-call output");
     let result = parse_result(&shell_output);
     assert!(
         result.exit_code.is_none_or(|exit_code| exit_code == 0),
@@ -1492,7 +1505,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
     let shell_output = responses
         .function_call_output_text("shell-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected shell-call output"));
+        .expect("expected shell-call output");
     let result = parse_result(&shell_output);
     assert!(
         result.exit_code.is_none_or(|exit_code| exit_code == 0),
@@ -1632,25 +1645,31 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     let approval_permissions = approval
         .additional_permissions
         .clone()
-        .unwrap_or_else(|| panic!("expected merged additional permissions"));
+        .expect("expected merged additional permissions");
     assert_eq!(approval_permissions.network, None);
 
     let approval_file_system = approval_permissions
         .file_system
-        .unwrap_or_else(|| panic!("expected filesystem permissions"));
-    let (approval_reads, approval_writes) = approval_file_system
+        .expect("expected filesystem permissions");
+    let codex_protocol::models::LegacyReadWriteRoots {
+        read: approval_reads,
+        write: approval_writes,
+    } = approval_file_system
         .legacy_read_write_roots()
-        .unwrap_or_else(|| panic!("expected legacy-compatible permissions"));
+        .expect("expected legacy-compatible permissions");
     assert!(approval_reads.as_ref().is_none_or(Vec::is_empty));
 
     let mut approval_writes = approval_writes.unwrap_or_default();
     approval_writes.sort_by_key(|path| path.display().to_string());
 
-    let (_, expected_writes) = merged_permissions
+    let codex_protocol::models::LegacyReadWriteRoots {
+        write: expected_writes,
+        ..
+    } = merged_permissions
         .file_system
-        .unwrap_or_else(|| panic!("expected merged filesystem permissions"))
+        .expect("expected merged filesystem permissions")
         .legacy_read_write_roots()
-        .unwrap_or_else(|| panic!("expected legacy-compatible permissions"));
+        .expect("expected legacy-compatible permissions");
     let mut expected_writes = expected_writes.unwrap_or_default();
     expected_writes.sort_by_key(|path| path.display().to_string());
 
@@ -1667,7 +1686,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     let exec_output = responses
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let result = parse_result(&exec_output);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout.trim(), "partial-grant-ok");
@@ -1785,7 +1804,7 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
 
     let output = second_turn
         .function_call_output_text("exec-call")
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     assert!(output.contains("missing `additional_permissions`"));
 
     Ok(())
@@ -1921,7 +1940,7 @@ async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
     let exec_output = second_turn
         .function_call_output_text("exec-call")
         .map(|output| json!({ "output": output }))
-        .unwrap_or_else(|| panic!("expected exec-call output"));
+        .expect("expected exec-call output");
     let result = parse_result(&exec_output);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout.trim(), "session-sticky-ok");

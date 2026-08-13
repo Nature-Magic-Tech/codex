@@ -1,13 +1,11 @@
-#![allow(clippy::expect_used)]
-
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_core::TurnInputRequest;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_apply_patch_shell_command_call_via_heredoc;
 use core_test_support::responses::ev_shell_command_call;
 use core_test_support::test_codex::ApplyPatchModelOutput;
-use core_test_support::test_codex::local_selections;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::PathBuf;
@@ -22,6 +20,9 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
 use codex_features::Feature;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -31,16 +32,17 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 #[cfg(target_os = "linux")]
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
+use core_test_support::TestTargetOs;
 use core_test_support::assert_regex_match;
-use core_test_support::get_remote_test_env;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -50,12 +52,16 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_remote_env;
 use core_test_support::skip_if_remote;
+use core_test_support::skip_if_target_windows;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
+use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
 use serde_json::json;
@@ -75,7 +81,7 @@ async fn apply_patch_harness_with(
     let builder = configure(test_codex());
     // Box harness construction so apply_patch_cli tests do not inline the
     // full test-thread startup path into each test future.
-    Box::pin(TestCodexHarness::with_remote_env_builder(builder)).await
+    Box::pin(TestCodexHarness::with_auto_env_builder(builder)).await
 }
 
 async fn submit_without_wait(harness: &TestCodexHarness, prompt: &str) -> Result<()> {
@@ -97,30 +103,26 @@ async fn submit_without_wait_with_turn_permissions(
     let test = harness.test();
     let session_model = test.session_configured.model.clone();
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(harness.cwd_abs())),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -135,18 +137,24 @@ fn restrictive_workspace_write_profile() -> PermissionProfile {
 }
 
 fn workspace_write_with_read_only_root(read_only_root: AbsolutePathBuf) -> PermissionProfile {
+    if cfg!(windows) {
+        return restrictive_workspace_write_profile();
+    }
+
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: read_only_root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     PermissionProfile::from_runtime_permissions(
@@ -163,12 +171,14 @@ fn workspace_write_with_unreadable_path(unreadable_path: AbsolutePathBuf) -> Per
                 path: unreadable_path,
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     PermissionProfile::from_runtime_permissions(
@@ -252,6 +262,112 @@ fn apply_patch_responses(
     ]
 }
 
+async fn assert_apply_patch_crlf_update(
+    configure: impl FnOnce(TestCodexBuilder) -> TestCodexBuilder,
+    model_output: CrLfApplyPatchModelOutput,
+    expected: &str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness_with(configure).await?;
+    let call_id = "apply-patch-crlf-rollout";
+    let file_name = "crlf.txt";
+    harness.write_file(file_name, "before\r\n").await?;
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {file_name}\n@@\n-before\n+after\n*** End Patch\n"
+    );
+    match model_output {
+        CrLfApplyPatchModelOutput::CustomTool => {
+            mount_apply_patch(&harness, call_id, &patch, "apply_patch done").await;
+        }
+        CrLfApplyPatchModelOutput::ShellCommandViaHeredoc => {
+            mount_apply_patch_model_output(
+                &harness,
+                call_id,
+                &patch,
+                "apply_patch done",
+                ApplyPatchModelOutput::ShellCommandViaHeredoc,
+            )
+            .await;
+        }
+    }
+
+    harness
+        .test()
+        .submit_turn_with_permission_profile(
+            "update the CRLF file with apply_patch",
+            PermissionProfile::Disabled,
+        )
+        .await?;
+
+    assert_eq!(harness.read_file_text(file_name).await?, expected);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CrLfApplyPatchModelOutput {
+    CustomTool,
+    ShellCommandViaHeredoc,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_normalizes_crlf_without_preserve_line_endings_feature() -> Result<()> {
+    assert_apply_patch_crlf_update(
+        |builder| builder,
+        CrLfApplyPatchModelOutput::CustomTool,
+        "after\n",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_preserves_crlf_with_preserve_line_endings_feature() -> Result<()> {
+    assert_apply_patch_crlf_update(
+        |builder| {
+            builder.with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::ApplyPatchPreserveLineEndings)
+                    .expect("feature should be enabled");
+            })
+        },
+        CrLfApplyPatchModelOutput::CustomTool,
+        "after\r\n",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_shell_heredoc_normalizes_crlf_without_preserve_line_endings_feature()
+-> Result<()> {
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
+    assert_apply_patch_crlf_update(
+        |builder| builder,
+        CrLfApplyPatchModelOutput::ShellCommandViaHeredoc,
+        "after\n",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_shell_heredoc_preserves_crlf_with_preserve_line_endings_feature() -> Result<()>
+{
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
+    assert_apply_patch_crlf_update(
+        |builder| {
+            builder.with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::ApplyPatchPreserveLineEndings)
+                    .expect("feature should be enabled");
+            })
+        },
+        CrLfApplyPatchModelOutput::ShellCommandViaHeredoc,
+        "after\r\n",
+    )
+    .await
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_uses_codex_self_exe_with_linux_sandbox_helper_alias() -> Result<()> {
@@ -322,6 +438,60 @@ D delete.txt
         "line1\nchanged\n"
     );
     assert!(!harness.path_exists("delete.txt").await?);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_cli_preserves_distinct_updated_paths() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    harness.write_file("first.txt", "first before\n").await?;
+    harness.write_file("second.txt", "second before\n").await?;
+
+    let patch = "*** Begin Patch\n*** Update File: first.txt\n@@\n-first before\n+first after\n*** Update File: second.txt\n@@\n-second before\n+second after\n*** End Patch";
+    let call_id = "apply-distinct-updates";
+    mount_apply_patch(&harness, call_id, patch, "done").await;
+
+    harness.submit("please update both files").await?;
+
+    assert_regex_match(
+        r"(?s)^Exit code: 0.*Success\. Updated the following files:\nM first\.txt\nM second\.txt\n?$",
+        &harness.apply_patch_output(call_id).await,
+    );
+    assert_eq!(harness.read_file_text("first.txt").await?, "first after\n");
+    assert_eq!(
+        harness.read_file_text("second.txt").await?,
+        "second after\n"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_cli_rejects_duplicate_resolved_paths() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    harness.write_file("duplicate.txt", "before\n").await?;
+
+    let patch = "*** Begin Patch\n*** Update File: duplicate.txt\n@@\n-before\n+first after\n*** Update File: ./duplicate.txt\n@@\n-before\n+second after\n*** End Patch";
+    let call_id = "apply-duplicate-resolved-path";
+    mount_apply_patch(&harness, call_id, patch, "done").await;
+
+    harness.submit("please apply both updates").await?;
+
+    let out = harness.apply_patch_output(call_id).await;
+    assert!(
+        out.contains("apply_patch verification failed"),
+        "expected verification failure: {out}"
+    );
+    assert!(
+        out.contains("multiple operations target"),
+        "expected duplicate-path diagnostics: {out}"
+    );
+    assert_eq!(harness.read_file_text("duplicate.txt").await?, "before\n");
 
     Ok(())
 }
@@ -650,6 +820,8 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()> {
+    // TODO(anp): Remove after apply_patch path handling supports target-native Windows paths.
+    skip_if_wine_exec!(Ok(()), "asserts POSIX path traversal behavior");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
@@ -829,6 +1001,10 @@ async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Res
     let harness_work_dir = work_dir.clone();
     let harness = apply_patch_harness_with(move |builder| {
         builder.with_config(move |config| {
+            config.workspace_roots = vec![harness_work_dir.clone()];
+            config
+                .permissions
+                .set_workspace_roots(config.workspace_roots.clone());
             config.cwd = harness_work_dir;
         })
     })
@@ -912,6 +1088,8 @@ async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_move_path_traversal_outside_workspace() -> Result<()> {
+    // TODO(anp): Remove after apply-patch fixtures use target-native paths.
+    skip_if_target_windows!(Ok(()), "asserts POSIX workspace traversal behavior");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
@@ -976,6 +1154,8 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_command_heredoc_with_cd_updates_relative_workdir() -> Result<()> {
+    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc and cd command");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
@@ -1258,6 +1438,8 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<()> {
+    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc and cd command");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
@@ -1320,6 +1502,8 @@ async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_turn_diff_paths_stay_repo_relative_when_session_cwd_is_nested() -> Result<()> {
+    // TODO(anp): Remove after apply_patch diff fixtures use target-native paths.
+    skip_if_wine_exec!(Ok(()), "asserts POSIX repository paths");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness_with(|builder| {
@@ -1329,25 +1513,24 @@ async fn apply_patch_turn_diff_paths_stay_repo_relative_when_session_cwd_is_nest
                 config.cwd = config.cwd.join("subdir");
             })
             .with_workspace_setup(|cwd, fs| async move {
+                let cwd_uri = PathUri::from_host_native_path(&cwd)?;
                 fs.create_directory(
-                    &cwd,
+                    &cwd_uri,
                     CreateDirectoryOptions { recursive: true },
                     /*sandbox*/ None,
                 )
                 .await?;
                 let repo_root = cwd.parent().expect("nested cwd should have parent");
+                let git_uri = PathUri::from_host_native_path(repo_root.join(".git"))?;
+                let repo_file_uri = PathUri::from_host_native_path(repo_root.join("repo.txt"))?;
                 fs.write_file(
-                    &repo_root.join(".git"),
+                    &git_uri,
                     b"gitdir: /tmp/fake-worktree\n".to_vec(),
                     /*sandbox*/ None,
                 )
                 .await?;
-                fs.write_file(
-                    &repo_root.join("repo.txt"),
-                    b"before\n".to_vec(),
-                    /*sandbox*/ None,
-                )
-                .await?;
+                fs.write_file(&repo_file_uri, b"before\n".to_vec(), /*sandbox*/ None)
+                    .await?;
                 Ok(())
             })
     })
@@ -1392,6 +1575,8 @@ async fn apply_patch_turn_diff_paths_stay_repo_relative_when_session_cwd_is_nest
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> Result<()> {
+    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
@@ -1449,6 +1634,8 @@ async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_accepts_lenient_heredoc_wrapped_patch() -> Result<()> {
+    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
+    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
@@ -1567,11 +1754,71 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Result<()> {
+async fn apply_patch_turn_diff_emits_portable_paths_for_remote_cwd() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    let Some(_remote_env) = get_remote_test_env() else {
-        return Ok(());
+    skip_if_no_remote_env!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    let test = harness.test();
+    let codex = test.codex.clone();
+
+    let call_id = "apply-foreign-windows-diff";
+    let file = "nested/foreign.txt";
+    let patch = format!("*** Begin Patch\n*** Add File: {file}\n+hello\n*** End Patch");
+    mount_apply_patch(&harness, call_id, &patch, "ok").await;
+
+    submit_without_wait(&harness, "emit diff for a foreign Windows cwd").await?;
+
+    let mut last_diff = None;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnDiff(ev) => {
+            last_diff = Some(ev.unified_diff.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let cwd = &test.executor_environment().selection().cwd;
+    let file_uri = cwd.join(file)?;
+    let expected_relative_path = match test_target_os() {
+        TestTargetOs::Linux | TestTargetOs::MacOs => "nested/foreign.txt",
+        TestTargetOs::Windows => r"nested\foreign.txt",
     };
+    assert_eq!(
+        file_uri.relative_path_from(cwd).as_deref(),
+        Some(expected_relative_path)
+    );
+    assert_eq!(
+        test.fs()
+            .read_file_text(&file_uri, /*sandbox*/ None)
+            .await?,
+        "hello\n"
+    );
+    assert_eq!(
+        last_diff.expect("expected TurnDiff event"),
+        r#"diff --git a/nested/foreign.txt b/nested/foreign.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce013625030ba8dba906f756967f9e9ca394464a
+--- /dev/null
++++ b/nested/foreign.txt
+@@ -0,0 +1 @@
++hello
+"#
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Result<()> {
+    // TODO(anp): Remove after shared-cwd helpers use target-native paths.
+    skip_if_target_windows!(
+        Ok(()),
+        "requires a cwd valid in local POSIX and remote Windows environments"
+    );
+    skip_if_no_network!(Ok(()));
+    skip_if_no_remote_env!(Ok(()));
 
     let server = start_mock_server().await;
     let mut builder = test_codex();
@@ -1582,10 +1829,11 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
     ))
     .abs();
+    let shared_cwd_uri = PathUri::from_host_native_path(&shared_cwd)?;
     let _ = fs::remove_dir_all(shared_cwd.as_path());
     test.fs()
         .remove(
-            &shared_cwd,
+            &shared_cwd_uri,
             RemoveOptions {
                 recursive: true,
                 force: true,
@@ -1596,7 +1844,7 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
     fs::create_dir_all(shared_cwd.as_path())?;
     test.fs()
         .create_directory(
-            &shared_cwd,
+            &shared_cwd_uri,
             CreateDirectoryOptions { recursive: true },
             /*sandbox*/ None,
         )
@@ -1636,19 +1884,17 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
         local(shared_cwd.clone()),
         TurnEnvironmentSelection {
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-            cwd: shared_cwd.clone(),
+            cwd: PathUri::from_abs_path(&shared_cwd),
+            workspace_roots: vec![PathUri::from_abs_path(&shared_cwd)],
         },
     ];
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "apply matching patches to local and remote environments".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(codex_protocol::protocol::TurnEnvironmentSelections::new(
                     test.config.cwd.clone(),
                     environments,
@@ -1656,17 +1902,17 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let mut last_diff = None;
@@ -1683,7 +1929,10 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
     assert_eq!(fs::read_to_string(shared_cwd.join(file_name))?, "local\n");
     assert_eq!(
         test.fs()
-            .read_file_text(&shared_cwd.join(file_name), /*sandbox*/ None)
+            .read_file_text(
+                &PathUri::from_host_native_path(shared_cwd.join(file_name))?,
+                /*sandbox*/ None,
+            )
             .await?,
         "remote\n"
     );
@@ -1710,7 +1959,7 @@ index 0000000000000000000000000000000000000000..9c998f7b995a7327177b38a90d138517
     let _ = fs::remove_dir_all(shared_cwd.as_path());
     test.fs()
         .remove(
-            &shared_cwd,
+            &shared_cwd_uri,
             RemoveOptions {
                 recursive: true,
                 force: true,
@@ -1765,8 +2014,8 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     .await;
 
     let diff = last_diff.expect("expected TurnDiff after two patches");
-    assert!(diff.contains("agg/a.txt"), "diff missing a.txt");
-    assert!(diff.contains("agg/b.txt"), "diff missing b.txt");
+    assert!(diff.contains("agg/a.txt"), "diff missing agg/a.txt: {diff}");
+    assert!(diff.contains("agg/b.txt"), "diff missing agg/b.txt: {diff}");
     // Final content reflects v2 for a.txt
     assert!(diff.contains("+v2\n") || diff.contains("v2\n"));
     Ok(())
@@ -1851,8 +2100,9 @@ async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> 
 
     let harness = apply_patch_harness_with(|builder| {
         builder.with_workspace_setup(|cwd, fs| async move {
+            let binary_path_uri = PathUri::from_host_native_path(cwd.join("binary.dat"))?;
             fs.write_file(
-                &cwd.join("binary.dat"),
+                &binary_path_uri,
                 vec![0xff, 0xfe, 0xfd],
                 /*sandbox*/ None,
             )

@@ -78,6 +78,7 @@
       "enum": [
         "auto",
         "prompt",
+        "writes",
         "approve"
       ],
       "type": "string"
@@ -133,6 +134,26 @@
     },
     "AppsDefaultConfig": {
       "properties": {
+        "approvals_reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default_tools_approval_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "destructive_enabled": {
           "default": true,
           "type": "boolean"
@@ -153,7 +174,6 @@
         {
           "enum": [
             "untrusted",
-            "on-failure",
             "on-request",
             "never"
           ],
@@ -457,6 +477,32 @@
     },
     "ConfigLayerSource": {
       "oneOf": [
+        {
+          "description": "Default configuration supplied with the installed Codex package.",
+          "properties": {
+            "file": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                }
+              ],
+              "description": "Path to the packaged default configuration file."
+            },
+            "type": {
+              "enum": [
+                "packagedDefaults"
+              ],
+              "title": "PackagedDefaultsConfigLayerSourceType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "file",
+            "type"
+          ],
+          "title": "PackagedDefaultsConfigLayerSource",
+          "type": "object"
+        },
         {
           "description": "Managed preferences layer delivered by MDM (macOS only).",
           "properties": {
@@ -789,6 +835,7 @@
       "enum": [
         "disabled",
         "cached",
+        "indexed",
         "live"
       ],
       "type": "string"
