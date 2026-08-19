@@ -22,7 +22,6 @@ codex-cli/README.md
 result
 
 # editor
-.vscode/
 .idea/
 .history/
 .zed/
